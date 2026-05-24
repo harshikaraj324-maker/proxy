@@ -47,7 +47,21 @@
   // Rewrite HTML so backend-relative URLs go through our proxy
   function rewriteHtml(html, backendPath) {
     // Spoof path so React Router sees the original backend path
-    const pathFix = `<script>(function(){history.replaceState(null,'','${backendPath}'+window.location.search);})();<\/script>`;
+    const pathFix = `<script>
+  (function(){
+    // Fix React Router path
+    history.replaceState(null,'','${backendPath}'+window.location.search);
+    // Intercept WebSocket — redirect proxy WS URLs to backend directly
+    var _WS = window.WebSocket;
+    window.WebSocket = function(url, proto) {
+      url = String(url)
+        .replace('wss://proxy-6tq.pages.dev', 'wss://mr-robot-5s3.pages.dev')
+        .replace('ws://proxy-6tq.pages.dev', 'ws://mr-robot-5s3.pages.dev');
+      return proto ? new _WS(url, proto) : new _WS(url);
+    };
+    Object.assign(window.WebSocket, _WS);
+  })();
+  <\/script>`;
 
     return html
       .replace('<head>', '<head>' + pathFix)
@@ -63,6 +77,13 @@
     const targetUrl = `${BACKEND}${backendPath}${url.search}`;
     const fwd = new Headers(request.headers);
     fwd.delete("host");
+
+    // WebSocket upgrade — forward directly to backend
+    if (request.headers.get("Upgrade") === "websocket") {
+      const wsUrl = targetUrl.replace(/^https?:\/\//, "wss://");
+      return fetch(wsUrl, { headers: fwd });
+    }
+
     let body = null;
     if (request.method !== "GET" && request.method !== "HEAD") body = await request.arrayBuffer();
     const up = await fetch(targetUrl, { method: request.method, headers: fwd, body: body || undefined, redirect: "follow" });
