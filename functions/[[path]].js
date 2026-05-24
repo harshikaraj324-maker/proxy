@@ -68,7 +68,9 @@
     if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
     /* ── Static frontend ──────────────────────────────────────────────── */
-    if (!path.startsWith("/api/") && path !== "/healthz" && path !== "/debug") {
+    const isApiPath = path.startsWith("/api/") || path === "/healthz" || path === "/debug";
+    const isBackendDashboard = path.startsWith("/preview/dashboard/") || path === "/preview/dashboard";
+    if (!isApiPath && !isBackendDashboard) {
       if (env.ASSETS) return env.ASSETS.fetch(request);
       return json({ msg: "ASSETS binding not available" });
     }
@@ -102,9 +104,13 @@
       });
     }
 
-    /* ── Dashboard HTML proxy ──────────────────────────────────────────── */
-    if (path.startsWith("/api/dashboard/") || path === "/api/dashboard") {
-      const suffix     = path.replace(/^\/api\/dashboard/, "/preview/dashboard");
+    /* ── Dashboard HTML proxy (/api/dashboard/* AND /preview/dashboard/*) ─ */
+    const isDashboard = path.startsWith("/api/dashboard/") || path === "/api/dashboard"
+                     || path.startsWith("/preview/dashboard/") || path === "/preview/dashboard";
+    if (isDashboard) {
+      const suffix = path.startsWith("/api/dashboard")
+        ? path.replace(/^\/api\/dashboard/, "/preview/dashboard")
+        : path;  // already /preview/dashboard/...
       const targetUrl  = `${BACKEND}${suffix}${url.search}`;
       const fwdHeaders = new Headers(request.headers);
       fwdHeaders.delete("host");
