@@ -1,6 +1,8 @@
 /**
    * MR ROBOT — Cloudflare Pages Function
-   * API routes handled here; all other paths served from static dist/ files.
+   * /api/relay/*      → https://mr-robot-5s3.pages.dev/api/*
+   * /api/dashboard/*  → https://mr-robot-5s3.pages.dev/preview/dashboard/*
+   * /                 → static dist/index.html
    */
 
   let proxyEnabled = true;
@@ -37,12 +39,10 @@
 
     if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
-    /* ── Static assets & frontend (everything not under /api) ─────── */
+    /* ── Static assets & frontend ─────────────────────────────────────── */
     if (!path.startsWith("/api/") && path !== "/healthz" && path !== "/debug") {
-      /* Let Cloudflare Pages serve the static dist files */
       if (env.ASSETS) return env.ASSETS.fetch(request);
-      /* fallback: 200 with a redirect note */
-      return json({ msg: "ASSETS binding not available — check Cloudflare Pages settings" }, 200);
+      return json({ msg: "ASSETS binding not available" }, 200);
     }
 
     /* ── debug ── */
@@ -79,7 +79,42 @@
       });
     }
 
-    /* ── proxy relay ── */
+    /* ── dashboard proxy (/api/dashboard/* → backend /preview/dashboard/*) ─ */
+    if (path.startsWith("/api/dashboard/") || path === "/api/dashboard") {
+      const BACKEND = "https://mr-robot-5s3.pages.dev";
+      const suffix  = path.replace(/^\/api\/dashboard/, "/preview/dashboard");
+      const targetUrl = `${BACKEND}${suffix}${url.search}`;
+      const fwdHeaders = new Headers(request.headers);
+      fwdHeaders.delete("host");
+      let body = null;
+      if (method !== "GET" && method !== "HEAD") body = await request.arrayBuffer();
+      try {
+        const upstream = await fetch(targetUrl, { method, headers: fwdHeaders, body: body || undefined, redirect: "follow" });
+        const ct  = upstream.headers.get("content-type") || "text/html";
+        const raw = await upstream.text();
+        // Rewrite absolute backend URLs in HTML so relative links still work
+        const rewritten = raw.replaceAll("https://mr-robot-5s3.pages.dev", "https://proxy-6tq.pages.dev/api/dashboard-asset");
+        return new Response(rewritten, { status: upstream.status, headers: { "Content-Type": ct, ...corsHeaders() } });
+      } catch (err) {
+        return json({ error: "Dashboard upstream error", detail: String(err) }, 502);
+      }
+    }
+
+    /* ── dashboard asset proxy (/api/dashboard-asset/*) ─────────────────── */
+    if (path.startsWith("/api/dashboard-asset/")) {
+      const BACKEND = "https://mr-robot-5s3.pages.dev";
+      const suffix  = path.replace(/^\/api\/dashboard-asset/, "");
+      const targetUrl = `${BACKEND}${suffix}${url.search}`;
+      try {
+        const upstream = await fetch(targetUrl, { method, headers: new Headers(request.headers), redirect: "follow" });
+        const ct = upstream.headers.get("content-type") || "application/octet-stream";
+        return new Response(upstream.body, { status: upstream.status, headers: { "Content-Type": ct, ...corsHeaders() } });
+      } catch (err) {
+        return json({ error: "Asset error", detail: String(err) }, 502);
+      }
+    }
+
+    /* ── relay proxy (/api/relay/* → backend /api/*) ─────────────────────── */
     if (path.startsWith("/api/relay/") || path === "/api/relay") {
       const PROXY_TARGET = (env && env.PROXY_TARGET) || "https://mr-robot-5s3.pages.dev/api";
       const suffix       = path.replace(/^\/api\/relay/, "") || "/";
