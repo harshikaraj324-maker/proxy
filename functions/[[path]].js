@@ -1,8 +1,9 @@
 /**
    * MR ROBOT — Cloudflare Pages Function
-   * /api/relay/*      → https://mr-robot-5s3.pages.dev/api/*
-   * /api/dashboard/*  → https://mr-robot-5s3.pages.dev/preview/dashboard/*
-   * /                 → static dist/index.html
+   * /api/relay/*          → https://mr-robot-5s3.pages.dev/api/*
+   * /api/dashboard/*      → backend /preview/dashboard/* (HTML rewritten)
+   * /api/dashboard-asset/*→ backend static assets pass-through
+   * /                     → static dist/index.html
    */
 
   let proxyEnabled = true;
@@ -31,6 +32,23 @@
     });
   }
 
+  const BACKEND = "https://mr-robot-5s3.pages.dev";
+
+  // Rewrite HTML: all relative /... paths → /api/dashboard-asset/...
+  // Keeps external URLs (https://) intact
+  function rewriteHtml(html) {
+    return html
+      // src="/  → src="/api/dashboard-asset/
+      .replace(/src="\/(?!\/)(?!api\/)/g, 'src="/api/dashboard-asset/')
+      // href="/ → href="/api/dashboard-asset/  (skip https:// and external)
+      .replace(/href="\/(?!\/)(?!api\/)/g, 'href="/api/dashboard-asset/')
+      // action="/ 
+      .replace(/action="\/(?!\/)(?!api\/)/g, 'action="/api/dashboard-asset/')
+      // absolute backend URLs
+      .replaceAll(BACKEND + "/assets/", "/api/dashboard-asset/assets/")
+      .replaceAll(BACKEND, "");
+  }
+
   export async function onRequest(context) {
     const { request, env } = context;
     const url    = new URL(request.url);
@@ -39,38 +57,33 @@
 
     if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
-    /* ── Static assets & frontend ─────────────────────────────────────── */
+    /* ── Static frontend ──────────────────────────────────────────────── */
     if (!path.startsWith("/api/") && path !== "/healthz" && path !== "/debug") {
       if (env.ASSETS) return env.ASSETS.fetch(request);
-      return json({ msg: "ASSETS binding not available" }, 200);
+      return json({ msg: "ASSETS binding not available" });
     }
 
     /* ── debug ── */
     if (path === "/debug") return json({ path, method, url: request.url, proxy: proxyEnabled });
 
     /* ── health ── */
-    if (path === "/healthz" || path === "/api/healthz") {
+    if (path === "/healthz" || path === "/api/healthz")
       return json({ status: "ok", proxy: proxyEnabled, ts: new Date().toISOString() });
-    }
 
-    /* ── relay state ── */
+    /* ── relay state/toggle/log/stream ─────────────────────────────────── */
     if (path === "/api/relay-state") return json({ enabled: proxyEnabled });
 
-    /* ── relay toggle ── */
     if (path === "/api/relay-toggle" && method === "POST") {
       proxyEnabled = !proxyEnabled;
       return json({ enabled: proxyEnabled });
     }
 
-    /* ── relay log ── */
     if (path === "/api/relay-log") return json(trafficLog);
 
-    /* ── relay SSE ── */
     if (path === "/api/relay-stream") {
       const { readable, writable } = new TransformStream();
       const writer = writable.getWriter();
-      const enc    = new TextEncoder();
-      writer.write(enc.encode(
+      writer.write(new TextEncoder().encode(
         `data: ${JSON.stringify({ type: "init", log: trafficLog, enabled: proxyEnabled })}\n\n`
       ));
       writer.close();
@@ -79,44 +92,52 @@
       });
     }
 
-    /* ── dashboard proxy (/api/dashboard/* → backend /preview/dashboard/*) ─ */
+    /* ── Dashboard HTML proxy ──────────────────────────────────────────── */
     if (path.startsWith("/api/dashboard/") || path === "/api/dashboard") {
-      const BACKEND = "https://mr-robot-5s3.pages.dev";
-      const suffix  = path.replace(/^\/api\/dashboard/, "/preview/dashboard");
-      const targetUrl = `${BACKEND}${suffix}${url.search}`;
+      const suffix     = path.replace(/^\/api\/dashboard/, "/preview/dashboard");
+      const targetUrl  = `${BACKEND}${suffix}${url.search}`;
       const fwdHeaders = new Headers(request.headers);
       fwdHeaders.delete("host");
       let body = null;
       if (method !== "GET" && method !== "HEAD") body = await request.arrayBuffer();
       try {
         const upstream = await fetch(targetUrl, { method, headers: fwdHeaders, body: body || undefined, redirect: "follow" });
-        const ct  = upstream.headers.get("content-type") || "text/html";
-        const raw = await upstream.text();
-        // Rewrite absolute backend URLs in HTML so relative links still work
-        const rewritten = raw.replaceAll("https://mr-robot-5s3.pages.dev", "https://proxy-6tq.pages.dev/api/dashboard-asset");
-        return new Response(rewritten, { status: upstream.status, headers: { "Content-Type": ct, ...corsHeaders() } });
+        const ct       = upstream.headers.get("content-type") || "text/html";
+        const raw      = await upstream.text();
+        const rewritten = ct.includes("text/html") ? rewriteHtml(raw) : raw;
+        return new Response(rewritten, {
+          status: upstream.status,
+          headers: { "Content-Type": ct, "Cache-Control": "no-store", ...corsHeaders() },
+        });
       } catch (err) {
-        return json({ error: "Dashboard upstream error", detail: String(err) }, 502);
+        return json({ error: "Dashboard error", detail: String(err) }, 502);
       }
     }
 
-    /* ── dashboard asset proxy (/api/dashboard-asset/*) ─────────────────── */
+    /* ── Dashboard asset pass-through ─────────────────────────────────── */
     if (path.startsWith("/api/dashboard-asset/")) {
-      const BACKEND = "https://mr-robot-5s3.pages.dev";
-      const suffix  = path.replace(/^\/api\/dashboard-asset/, "");
+      const suffix    = path.replace(/^\/api\/dashboard-asset/, "");
       const targetUrl = `${BACKEND}${suffix}${url.search}`;
+      const fwdHeaders = new Headers(request.headers);
+      fwdHeaders.delete("host");
       try {
-        const upstream = await fetch(targetUrl, { method, headers: new Headers(request.headers), redirect: "follow" });
+        const upstream = await fetch(targetUrl, { method: "GET", headers: fwdHeaders, redirect: "follow" });
         const ct = upstream.headers.get("content-type") || "application/octet-stream";
-        return new Response(upstream.body, { status: upstream.status, headers: { "Content-Type": ct, ...corsHeaders() } });
+        const raw = await upstream.text();
+        // Rewrite any JS/CSS that reference backend URLs
+        const rewritten = raw.replaceAll(BACKEND, "");
+        return new Response(rewritten, {
+          status: upstream.status,
+          headers: { "Content-Type": ct, "Cache-Control": "public, max-age=86400", ...corsHeaders() },
+        });
       } catch (err) {
         return json({ error: "Asset error", detail: String(err) }, 502);
       }
     }
 
-    /* ── relay proxy (/api/relay/* → backend /api/*) ─────────────────────── */
+    /* ── Relay proxy (/api/relay/* → backend /api/*) ─────────────────── */
     if (path.startsWith("/api/relay/") || path === "/api/relay") {
-      const PROXY_TARGET = (env && env.PROXY_TARGET) || "https://mr-robot-5s3.pages.dev/api";
+      const PROXY_TARGET = (env && env.PROXY_TARGET) || `${BACKEND}/api`;
       const suffix       = path.replace(/^\/api\/relay/, "") || "/";
       const targetUrl    = `${PROXY_TARGET}${suffix}${url.search}`;
       const start        = Date.now();
