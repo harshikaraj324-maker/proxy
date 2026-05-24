@@ -34,17 +34,27 @@
 
   const BACKEND = "https://mr-robot-5s3.pages.dev";
 
-  // Rewrite HTML: all relative /... paths → /api/dashboard-asset/...
-  // Keeps external URLs (https://) intact
-  function rewriteHtml(html) {
+  // Rewrite HTML: fix asset URLs + inject path spoof so React Router matches
+  function rewriteHtml(html, originalPath) {
+    // The backend serves this SPA at /preview/dashboard/* so React Router
+    // expects that path. We inject a script to replaceState before React boots.
+    const pathFix = `<script>
+    (function(){
+      var search = window.location.search;
+      history.replaceState(null,'','${originalPath}'+search);
+    })();
+  </script>`;
+
     return html
+      // inject path fix right after <head>
+      .replace('<head>', '<head>' + pathFix)
       // src="/  → src="/api/dashboard-asset/
       .replace(/src="\/(?!\/)(?!api\/)/g, 'src="/api/dashboard-asset/')
-      // href="/ → href="/api/dashboard-asset/  (skip https:// and external)
+      // href="/ → href="/api/dashboard-asset/  (skip https:// and //external)
       .replace(/href="\/(?!\/)(?!api\/)/g, 'href="/api/dashboard-asset/')
-      // action="/ 
+      // action="/
       .replace(/action="\/(?!\/)(?!api\/)/g, 'action="/api/dashboard-asset/')
-      // absolute backend URLs
+      // absolute backend URLs in assets
       .replaceAll(BACKEND + "/assets/", "/api/dashboard-asset/assets/")
       .replaceAll(BACKEND, "");
   }
@@ -104,7 +114,7 @@
         const upstream = await fetch(targetUrl, { method, headers: fwdHeaders, body: body || undefined, redirect: "follow" });
         const ct       = upstream.headers.get("content-type") || "text/html";
         const raw      = await upstream.text();
-        const rewritten = ct.includes("text/html") ? rewriteHtml(raw) : raw;
+        const rewritten = ct.includes("text/html") ? rewriteHtml(raw, suffix) : raw;
         return new Response(rewritten, {
           status: upstream.status,
           headers: { "Content-Type": ct, "Cache-Control": "no-store", ...corsHeaders() },
